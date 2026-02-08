@@ -7,6 +7,14 @@
   <img src="assets/demo2.png" alt="demo" width="700">
 </p>
 
+<p align="center">
+  <img alt="GitHub Actions Workflow Status" src="https://img.shields.io/github/actions/workflow/status/VG-dev1/flux/rust.yml?style=for-the-badge">
+  <img alt="Crates.io Version" src="https://img.shields.io/crates/v/flux-cli?style=for-the-badge">
+  <img alt="Crates.io License" src="https://img.shields.io/crates/l/flux-cli?style=for-the-badge">
+  <img alt="Crates.io Total Downloads" src="https://img.shields.io/crates/d/flux-cli?style=for-the-badge">
+</p>
+
+
 ## Why flux
 
 Tools like `htop` and `btop` cram an overwhelming amount of information onto the screen-columns, graphs, and stats everywhere, making it hard to find the process you actually care about. `flux` strips away the clutter and focuses on what matters: quickly finding, monitoring, and acting on processes in a clean, readable interface. With live CPU and memory tracking, port-aware process discovery, and intuitive keyboard navigation, `flux` gives you all the actionable insights without the messy visual noise, letting you manage your system faster and more efficiently.
