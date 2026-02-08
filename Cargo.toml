@@ -1,5 +1,5 @@
 [package]
-name = "flux"
+name = "flux-cli"
 version = "0.1.0"
 edition = "2024"
 description = "Search, monitor, and nuke processes with ease, with system resource tracking"
