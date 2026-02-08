@@ -1,0 +1,25 @@
+[package]
+name = "flux"
+version = "0.1.0"
+edition = "2024"
+description = "Search, monitor, and nuke processes with ease, with system resource tracking"
+license = "MIT"
+keywords = ["cli", "command-line", "process", "kill", "terminal"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "flux"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+sysinfo = "0.32"
+colored = "2"
+inquire = "0.7"
+terminal_size = "0.4"
+ratatui = "0.29"
+crossterm = "0.28"
+listeners = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
