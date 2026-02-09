@@ -546,10 +546,9 @@ fn run_live_mode(
 
 fn refresh_processes(sys: &mut System, filter: Option<&str>, sort_by: SortBy) -> Vec<ProcessInfo> {
     sys.refresh_all();
-    thread::sleep(Duration::from_millis(200));
-    sys.refresh_all();
 
     let name_width = calculate_name_width(false);
+    let cpu_count = sys.cpus().len() as f32;
 
     let mut processes: Vec<ProcessInfo> = sys
         .processes()
@@ -566,7 +565,7 @@ fn refresh_processes(sys: &mut System, filter: Option<&str>, sort_by: SortBy) ->
             Some(ProcessInfo {
                 pid: pid.as_u32(),
                 name,
-                cpu: proc.cpu_usage(),
+                cpu: proc.cpu_usage() / cpu_count,
                 memory: proc.memory() / 1024 / 1024,
                 name_width,
                 port: None,
@@ -586,11 +585,10 @@ fn refresh_processes_with_ports(
     sort_by: SortBy,
 ) -> Vec<ProcessInfo> {
     sys.refresh_all();
-    thread::sleep(Duration::from_millis(200));
-    sys.refresh_all();
 
     let port_map = get_port_mappings();
     let name_width = calculate_name_width(true);
+    let cpu_count = sys.cpus().len() as f32;
 
     let mut processes: Vec<ProcessInfo> = sys
         .processes()
@@ -610,7 +608,7 @@ fn refresh_processes_with_ports(
                 }
             }
 
-            let cpu = proc.cpu_usage();
+            let cpu = proc.cpu_usage() / cpu_count;
             let memory = proc.memory() / 1024 / 1024;
 
             ports
