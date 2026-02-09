@@ -68,7 +68,7 @@ flux -f chrome --nuke
 ### From source
 
 ```bash
-cargo install flux
+cargo install flux-cli
 ```
 
 ## License
