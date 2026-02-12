@@ -1,6 +1,6 @@
 [package]
 name = "flux-cli"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Search, monitor, and nuke processes with ease, with system resource tracking"
 license = "MIT"
