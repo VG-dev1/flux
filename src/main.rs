@@ -12,7 +12,6 @@ use ratatui::{
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::stdout;
-use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use terminal_size::{terminal_size, Width};
@@ -34,36 +33,30 @@ enum SortBy {
     Pid,
     Name,
     Port,
+    Disk,
 }
 
 #[derive(Parser)]
-#[command(name = "flux", version, about = "Search, monitor, and nuke processes with ease, with system resource tracking", disable_version_flag = true)]
+#[command(name = "flux", version, about = "Search, monitor, and nuke processes with ease", disable_version_flag = true)]
 struct Args {
-    /// Print version
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
-    /// Pre-filter processes by name
     #[arg(short, long)]
     filter: Option<String>,
 
-    /// Signal to send (default SIGKILL)
     #[arg(short, long, default_value = "KILL")]
     signal: String,
 
-    /// Sort processes by field (default: cpu)
     #[arg(long, value_enum, default_value = "cpu")]
     sort: SortBy,
 
-    /// Show only processes with open ports
     #[arg(long)]
     ports: bool,
 
-    /// Filter by specific port number
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
 
-    /// Nuke all matching processes with pre-confirmation to the filter (-f) or the port (--port)
     #[arg(long = "nuke")]
     confirm_nuke: bool,
 
@@ -84,7 +77,7 @@ fn calculate_name_width(ports_mode: bool) -> usize {
         .map(|(Width(w), _)| w as usize)
         .unwrap_or(80);
 
-    let mut fixed = 6 + 7 + 7 + 9 + 4;
+    let mut fixed = 6 + 7 + 7 + 9 + 12 + 4;
 
     if ports_mode {
         fixed += 10;
@@ -100,6 +93,8 @@ struct ProcessInfo {
     name: String,
     cpu: f32,
     memory: u64,
+    disk_read: u64,
+    disk_write: u64,
     name_width: usize,
     port: Option<u16>,
     protocol: Option<String>,
@@ -112,6 +107,7 @@ impl fmt::Display for ProcessInfo {
         let name_formatted = format!("{:<width$}", display_name, width = self.name_width);
         let cpu_formatted = format!("{:>6.1}%", self.cpu);
         let mem_formatted = format!("{:>9}", format!("{} MB", self.memory));
+        let disk_formatted = format!("{:>10} KB/s", (self.disk_read + self.disk_write) / 1024);
 
         let pid_str = Colorize::dimmed(pid_formatted.as_str());
         let name_str = Colorize::white(name_formatted.as_str());
@@ -129,6 +125,7 @@ impl fmt::Display for ProcessInfo {
         } else {
             Colorize::dimmed(mem_formatted.as_str())
         };
+        let disk_str = Colorize::dimmed(disk_formatted.as_str());
 
         if let Some(port) = self.port {
             let proto = self.protocol.as_deref().unwrap_or("TCP");
@@ -136,11 +133,11 @@ impl fmt::Display for ProcessInfo {
             let port_str = Colorize::green(port_formatted.as_str());
             write!(
                 f,
-                "{} {} {} {} {}",
-                port_str, pid_str, name_str, cpu_colored, mem_colored
+                "{} {} {} {} {} {}",
+                port_str, pid_str, name_str, cpu_colored, mem_colored, disk_str
             )
         } else {
-            write!(f, "{} {} {} {}", pid_str, name_str, cpu_colored, mem_colored)
+            write!(f, "{} {} {} {} {}", pid_str, name_str, cpu_colored, mem_colored, disk_str)
         }
     }
 }
@@ -169,12 +166,12 @@ fn sort_processes(processes: &mut Vec<ProcessInfo>, sort_by: SortBy) {
         SortBy::Pid => processes.sort_by(|a, b| a.pid.cmp(&b.pid)),
         SortBy::Name => processes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         SortBy::Port => processes.sort_by(|a, b| a.port.cmp(&b.port)),
+        SortBy::Disk => processes.sort_by(|a, b| (b.disk_read + b.disk_write).cmp(&(a.disk_read + a.disk_write))),
     }
 }
 
 fn get_port_mappings() -> HashMap<u32, Vec<(u16, String)>> {
     let mut map: HashMap<u32, Vec<(u16, String)>> = HashMap::new();
-
     if let Ok(listeners) = listeners::get_all() {
         for listener in listeners {
             let port = listener.socket.port();
@@ -185,14 +182,12 @@ fn get_port_mappings() -> HashMap<u32, Vec<(u16, String)>> {
             }
         }
     }
-
     map
 }
 
 fn parse_signal(signal_str: &str) -> Result<Signal, String> {
     let signal_str = signal_str.to_uppercase();
     let signal_str = signal_str.strip_prefix("SIG").unwrap_or(&signal_str);
-
     #[cfg(unix)]
     {
         match signal_str {
@@ -208,7 +203,6 @@ fn parse_signal(signal_str: &str) -> Result<Signal, String> {
             _ => Err(format!("Unknown signal: {}", signal_str)),
         }
     }
-
     #[cfg(windows)]
     {
         match signal_str {
@@ -224,9 +218,7 @@ fn draw_resource_graphs(frame: &mut Frame, history: &ResourceHistory) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(frame.area());
-
     let orange = Color::Rgb(255, 165, 0);
-
     let cpu_line = Sparkline::default()
         .block(
             Block::default()
@@ -236,7 +228,6 @@ fn draw_resource_graphs(frame: &mut Frame, history: &ResourceHistory) {
         )
         .data(&history.cpu_data)
         .style(Style::default().fg(Color::Cyan));
-
     let mem_line = Sparkline::default()
         .block(
             Block::default()
@@ -247,7 +238,6 @@ fn draw_resource_graphs(frame: &mut Frame, history: &ResourceHistory) {
         )
         .data(&history.mem_data)
         .style(Style::default().fg(Color::Magenta));
-
     frame.render_widget(cpu_line, chunks[0]);
     frame.render_widget(mem_line, chunks[1]);
 }
@@ -263,51 +253,42 @@ fn run_live_mode(
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-
     let mut table_state = TableState::default();
     table_state.select(Some(0));
     let mut selected_pids: HashSet<u32> = HashSet::new();
     let mut last_refresh = Instant::now();
     let refresh_interval = Duration::from_secs(2);
     let mut sys = System::new_all();
-
     let mut history = ResourceHistory {
         cpu_data: Vec::new(),
         mem_data: Vec::new(),
         max_samples: 100,
     };
-
     let mut processes = if ports_mode {
         refresh_processes_with_ports(&mut sys, filter, port_filter, sort_by)
     } else {
         refresh_processes(&mut sys, filter, sort_by)
     };
     let mut show_confirm = false;
-
     loop {
         if last_refresh.elapsed() >= refresh_interval && !show_confirm {
             sys.refresh_cpu_all();
             sys.refresh_memory();
-
             processes = if ports_mode {
                 refresh_processes_with_ports(&mut sys, filter, port_filter, sort_by)
             } else {
                 refresh_processes(&mut sys, filter, sort_by)
             };
-
             let global_cpu = sys.global_cpu_usage() as u64;
             let total_mem = sys.used_memory() / 1024 / 1024;
             history.push(global_cpu, total_mem);
-            
             last_refresh = Instant::now();
-
             if let Some(selected) = table_state.selected() {
                 if selected >= processes.len() && !processes.is_empty() {
                     table_state.select(Some(processes.len() - 1));
                 }
             }
         }
-
         terminal.draw(|frame| {
             if show_resources {
                 draw_resource_graphs(frame, &history);
@@ -318,68 +299,42 @@ fn run_live_mode(
                     .map(|p| {
                         let is_selected = selected_pids.contains(&p.pid);
                         let marker = if is_selected { "●" } else { " " };
-                        let cpu_style = if p.cpu > 50.0 {
-                            Style::default().fg(Color::Red).bold()
-                        } else if p.cpu > 10.0 {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
-                        let memory_style = if p.memory > 500 {
-                            Style::default().fg(Color::Red).bold()
-                        } else if p.memory > 100 {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
+                        let cpu_style = if p.cpu > 50.0 { Style::default().fg(Color::Red).bold() } else if p.cpu > 10.0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                        let memory_style = if p.memory > 500 { Style::default().fg(Color::Red).bold() } else if p.memory > 100 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                        let disk_io = p.disk_read + p.disk_write;
+                        let disk_style = if disk_io > 1024 * 1024 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
 
                         let mut cells = vec![
-                            Cell::from(marker).style(if is_selected {
-                                Style::default().fg(Color::Green).bold()
-                            } else {
-                                Style::default()
-                            }),
+                            Cell::from(marker).style(if is_selected { Style::default().fg(Color::Green).bold() } else { Style::default() }),
                         ];
-
                         if ports_mode {
-                            let port_str = p
-                                .port
-                                .map(|port| format!("{:<5}", port))
-                                .unwrap_or_default();
+                            let port_str = p.port.map(|port| format!("{:<5}", port)).unwrap_or_default();
                             let proto_str = p.protocol.as_deref().unwrap_or("");
-                            cells.push(
-                                Cell::from(format!("{} {:>3}", port_str, proto_str))
-                                    .style(Style::default().fg(Color::Green)),
-                            );
+                            cells.push(Cell::from(format!("{} {:>3}", port_str, proto_str)).style(Style::default().fg(Color::Green)));
                         }
-
                         cells.extend([
-                            Cell::from(format!("{:<7}", p.pid))
-                                .style(Style::default().fg(Color::DarkGray)),
+                            Cell::from(format!("{:<7}", p.pid)).style(Style::default().fg(Color::DarkGray)),
                             Cell::from(truncate(&p.name, 40)).style(Style::default().fg(Color::White)),
                             Cell::from(format!("{:>6.1}%", p.cpu)).style(cpu_style),
                             Cell::from(format!("{:>6} MB", p.memory)).style(memory_style),
+                            Cell::from(format!("{:>8} KB/s", disk_io / 1024)).style(disk_style),
                         ]);
-
                         Row::new(cells)
                     })
                     .collect();
 
+                let orange = Color::Rgb(255, 165, 0);
                 let (header, widths): (Row, Vec<Constraint>) = if ports_mode {
                     (
                         Row::new(vec![
                             Cell::from(" "),
-                            Cell::from(format!("{:<9}", "PORT"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from(format!("{:<7}", "PID"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from("NAME").style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from(format!("{:>7}", "CPU %"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from(format!("{:>9}", "MEMORY"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                        ])
-                        .style(Style::default().bold()),
+                            Cell::from(format!("{:<9}", "PORT")).style(Style::default().fg(orange)),
+                            Cell::from(format!("{:<7}", "PID")).style(Style::default().fg(orange)),
+                            Cell::from("NAME").style(Style::default().fg(orange)),
+                            Cell::from(format!("{:>7}", "CPU %")).style(Style::default().fg(orange)),
+                            Cell::from(format!("{:>9}", "MEMORY")).style(Style::default().fg(orange)),
+                            Cell::from(format!("{:>12}", "DISK")).style(Style::default().fg(orange)),
+                        ]).style(Style::default().bold()),
                         vec![
                             Constraint::Length(2),
                             Constraint::Length(9),
@@ -387,77 +342,49 @@ fn run_live_mode(
                             Constraint::Min(20),
                             Constraint::Length(7),
                             Constraint::Length(9),
+                            Constraint::Length(15),
                         ],
                     )
                 } else {
                     (
                         Row::new(vec![
                             Cell::from(" "),
-                            Cell::from(format!("{:<7}", "PID"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from("NAME")
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from(format!("{:>7}", "CPU %"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            Cell::from(format!("{:>9}", "MEMORY"))
-                                .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                        ])
-                        .style(Style::default().bold()),
+                            Cell::from(format!("{:<7}", "PID")).style(Style::default().fg(orange)),
+                            Cell::from("NAME").style(Style::default().fg(orange)),
+                            Cell::from(format!("{:>7}", "CPU %")).style(Style::default().fg(orange)),
+                            Cell::from(format!("{:>9}", "MEMORY")).style(Style::default().fg(orange)),
+                            Cell::from(format!("{:>12}", "DISK")).style(Style::default().fg(orange)),
+                        ]).style(Style::default().bold()),
                         vec![
                             Constraint::Length(2),
                             Constraint::Length(7),
                             Constraint::Min(20),
                             Constraint::Length(7),
                             Constraint::Length(9),
+                            Constraint::Length(15),
                         ],
                     )
                 };
 
                 let selected_count = selected_pids.len();
-                let title = if selected_count > 0 {
-                    format!(" flux - {} selected ", selected_count)
-                } else {
-                    " flux ".to_string()
-                };
-
+                let title = if selected_count > 0 { format!(" flux - {} selected ", selected_count) } else { " flux ".to_string() };
                 let table = Table::new(rows, widths)
                     .header(header)
                     .block(
                         Block::default()
-                            .title(
-                                Line::from(title)
-                                    .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            )
-                            .border_style(Style::default().fg(Color::Rgb(255, 165, 0)))
-                            .title_bottom(
-                                Line::from(" ↑↓ - navigate • Space - select • Enter - kill • q - quit • a - select all ")
-                                    .style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                            ),
+                            .title(Line::from(title).style(Style::default().fg(orange)))
+                            .border_style(Style::default().fg(orange))
+                            .title_bottom(Line::from(" ↑↓ - navigate • Space - select • Enter - kill • q - quit • a - select all ").style(Style::default().fg(orange))),
                     )
                     .row_highlight_style(Style::default().bg(Color::Rgb(128, 85, 0)).fg(Color::White))
                     .highlight_symbol("▶ ");
-
                 frame.render_stateful_widget(table, area, &mut table_state);
-
                 if show_confirm {
                     let popup_area = centered_rect(50, 20, area);
                     frame.render_widget(Clear, popup_area);
-
                     let count = selected_pids.len();
-                    let text = format!(
-                        "Kill {} process{}?\nPIDs: {:?}\n\n[Enter] Confirm  [Esc] Cancel",
-                        count,
-                        if count == 1 { "" } else { "es" },
-                        selected_pids
-                    );
-                    let popup = Paragraph::new(text)
-                        .alignment(Alignment::Center)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(" Confirm ")
-                                .border_style(Style::default().fg(Color::Rgb(255, 165, 0))),
-                        );
+                    let text = format!("Kill {} process{}?\nPIDs: {:?}\n\n[Enter] Confirm  [Esc] Cancel", count, if count == 1 { "" } else { "es" }, selected_pids);
+                    let popup = Paragraph::new(text).alignment(Alignment::Center).block(Block::default().borders(Borders::ALL).title(" Confirm ").border_style(Style::default().fg(orange)));
                     frame.render_widget(popup, popup_area);
                 }
             }
@@ -468,60 +395,21 @@ fn run_live_mode(
                 if key.kind == KeyEventKind::Press {
                     if show_confirm {
                         match key.code {
-                            KeyCode::Enter => {
-                                break;
-                            }
-                            KeyCode::Esc => {
-                                show_confirm = false;
-                            }
+                            KeyCode::Enter => break,
+                            KeyCode::Esc => show_confirm = false,
                             _ => {}
                         }
                     } else {
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                selected_pids.clear();
-                                break;
-                            }
+                            KeyCode::Char('q') | KeyCode::Esc => { selected_pids.clear(); break; }
                             KeyCode::Char('a') => {
                                 let all_selected = processes.iter().all(|p| selected_pids.contains(&p.pid));
-                                if all_selected {
-                                    selected_pids.clear();
-                                } else {
-                                    for proc in &processes {
-                                        selected_pids.insert(proc.pid);
-                                    }
-                                }
+                                if all_selected { selected_pids.clear(); } else { for proc in &processes { selected_pids.insert(proc.pid); } }
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if let Some(selected) = table_state.selected() {
-                                    if selected > 0 {
-                                        table_state.select(Some(selected - 1));
-                                    }
-                                }
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if let Some(selected) = table_state.selected() {
-                                    if selected < processes.len().saturating_sub(1) {
-                                        table_state.select(Some(selected + 1));
-                                    }
-                                }
-                            }
-                            KeyCode::Char(' ') => {
-                                if let Some(selected) = table_state.selected() {
-                                    if let Some(proc) = processes.get(selected) {
-                                        if selected_pids.contains(&proc.pid) {
-                                            selected_pids.remove(&proc.pid);
-                                        } else {
-                                            selected_pids.insert(proc.pid);
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if !selected_pids.is_empty() {
-                                    show_confirm = true;
-                                }
-                            }
+                            KeyCode::Up | KeyCode::Char('k') => { if let Some(selected) = table_state.selected() { if selected > 0 { table_state.select(Some(selected - 1)); } } }
+                            KeyCode::Down | KeyCode::Char('j') => { if let Some(selected) = table_state.selected() { if selected < processes.len().saturating_sub(1) { table_state.select(Some(selected + 1)); } } }
+                            KeyCode::Char(' ') => { if let Some(selected) = table_state.selected() { if let Some(proc) = processes.get(selected) { if selected_pids.contains(&proc.pid) { selected_pids.remove(&proc.pid); } else { selected_pids.insert(proc.pid); } } } }
+                            KeyCode::Enter => { if !selected_pids.is_empty() { show_confirm = true; } }
                             _ => {}
                         }
                     }
@@ -532,131 +420,70 @@ fn run_live_mode(
 
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
-
     if !selected_pids.is_empty() {
-        let to_kill: Vec<ProcessInfo> = processes
-            .into_iter()
-            .filter(|p| selected_pids.contains(&p.pid))
-            .collect();
+        let to_kill: Vec<ProcessInfo> = processes.into_iter().filter(|p| selected_pids.contains(&p.pid)).collect();
         kill_processes(to_kill, signal);
     }
-
     Ok(())
 }
 
 fn refresh_processes(sys: &mut System, filter: Option<&str>, sort_by: SortBy) -> Vec<ProcessInfo> {
     sys.refresh_all();
-
     let name_width = calculate_name_width(false);
     let cpu_count = sys.cpus().len() as f32;
 
-    let mut processes: Vec<ProcessInfo> = sys
-        .processes()
-        .iter()
-        .filter_map(|(pid, proc)| {
-            let name = proc.name().to_string_lossy().to_string();
-
-            if let Some(f) = filter {
-                if !name.to_lowercase().contains(&f.to_lowercase()) {
-                    return None;
-                }
-            }
-
-            Some(ProcessInfo {
-                pid: pid.as_u32(),
-                name,
-                cpu: proc.cpu_usage() / cpu_count,
-                memory: proc.memory() / 1024 / 1024,
-                name_width,
-                port: None,
-                protocol: None,
-            })
+    let mut processes: Vec<ProcessInfo> = sys.processes().iter().filter_map(|(pid, proc)| {
+        let name = proc.name().to_string_lossy().to_string();
+        if let Some(f) = filter { if !name.to_lowercase().contains(&f.to_lowercase()) { return None; } }
+        Some(ProcessInfo {
+            pid: pid.as_u32(),
+            name,
+            cpu: proc.cpu_usage() / cpu_count,
+            memory: proc.memory() / 1024 / 1024,
+            disk_read: proc.disk_usage().read_bytes,
+            disk_write: proc.disk_usage().written_bytes,
+            name_width,
+            port: None,
+            protocol: None,
         })
-        .collect();
+    }).collect();
 
     sort_processes(&mut processes, sort_by);
     processes
 }
 
-fn refresh_processes_with_ports(
-    sys: &mut System,
-    filter: Option<&str>,
-    port_filter: Option<u16>,
-    sort_by: SortBy,
-) -> Vec<ProcessInfo> {
+fn refresh_processes_with_ports(sys: &mut System, filter: Option<&str>, port_filter: Option<u16>, sort_by: SortBy) -> Vec<ProcessInfo> {
     sys.refresh_all();
-
     let port_map = get_port_mappings();
     let name_width = calculate_name_width(true);
     let cpu_count = sys.cpus().len() as f32;
 
-    let mut processes: Vec<ProcessInfo> = sys
-        .processes()
-        .iter()
-        .flat_map(|(pid, proc)| {
-            let pid_u32 = pid.as_u32();
-            let ports = match port_map.get(&pid_u32) {
-                Some(p) => p,
-                None => return vec![],
-            };
-
-            let name = proc.name().to_string_lossy().to_string();
-
-            if let Some(f) = filter {
-                if !name.to_lowercase().contains(&f.to_lowercase()) {
-                    return vec![];
-                }
-            }
-
-            let cpu = proc.cpu_usage() / cpu_count;
-            let memory = proc.memory() / 1024 / 1024;
-
-            ports
-                .iter()
-                .filter_map(|(port, protocol)| {
-                    if let Some(target_port) = port_filter {
-                        if *port != target_port {
-                            return None;
-                        }
-                    }
-
-                    Some(ProcessInfo {
-                        pid: pid_u32,
-                        name: name.clone(),
-                        cpu,
-                        memory,
-                        name_width,
-                        port: Some(*port),
-                        protocol: Some(protocol.clone()),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut processes: Vec<ProcessInfo> = sys.processes().iter().flat_map(|(pid, proc)| {
+        let pid_u32 = pid.as_u32();
+        let ports = match port_map.get(&pid_u32) { Some(p) => p, None => return vec![], };
+        let name = proc.name().to_string_lossy().to_string();
+        if let Some(f) = filter { if !name.to_lowercase().contains(&f.to_lowercase()) { return vec![]; } }
+        let cpu = proc.cpu_usage() / cpu_count;
+        let memory = proc.memory() / 1024 / 1024;
+        let d_read = proc.disk_usage().read_bytes;
+        let d_write = proc.disk_usage().written_bytes;
+        ports.iter().filter_map(|(port, protocol)| {
+            if let Some(target_port) = port_filter { if *port != target_port { return None; } }
+            Some(ProcessInfo { pid: pid_u32, name: name.clone(), cpu, memory, disk_read: d_read, disk_write: d_write, name_width, port: Some(*port), protocol: Some(protocol.clone()) })
+        }).collect::<Vec<_>>()
+    }).collect();
 
     sort_processes(&mut processes, sort_by);
     processes
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(r);
-
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(popup_layout[1])[1]
+    let popup_layout = Layout::vertical([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)]).split(r);
+    Layout::horizontal([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)]).split(popup_layout[1])[1]
 }
 
 fn kill_processes(selected: Vec<ProcessInfo>, signal: Signal) {
     let s = System::new_all();
-
     for proc in selected {
         let mut killed = false;
 
@@ -664,33 +491,15 @@ fn kill_processes(selected: Vec<ProcessInfo>, signal: Signal) {
         {
             use nix::unistd::Pid as NixPid;
             use nix::sys::signal::kill as nix_kill;
-            if nix_kill(NixPid::from_raw(proc.pid as i32), signal).is_ok() {
-                killed = true;
-            }
+            if nix_kill(NixPid::from_raw(proc.pid as i32), signal).is_ok() { killed = true; }
         }
 
         #[cfg(windows)]
         {
-            if let Some(process) = s.process(sysinfo::Pid::from_u32(proc.pid)) {
-                killed = process.kill();
-            }
+            if let Some(process) = s.process(sysinfo::Pid::from_u32(proc.pid)) { killed = process.kill(); }
         }
-
-        if killed {
-            println!(
-                "{} {} {}",
-                Colorize::green("Killed"),
-                Colorize::bold(proc.name.as_str()),
-                Colorize::dimmed(format!("(PID: {})", proc.pid).as_str())
-            );
-        } else {
-            eprintln!(
-                "{} {} {}",
-                Colorize::red("Failed"),
-                Colorize::bold(proc.name.as_str()),
-                Colorize::dimmed(format!("(PID: {})", proc.pid).as_str())
-            );
-        }
+        if killed { println!("{} {} {}", Colorize::green("Killed"), Colorize::bold(proc.name.as_str()), Colorize::dimmed(format!("(PID: {})", proc.pid).as_str())); }
+        else { eprintln!("{} {} {}", Colorize::red("Failed"), Colorize::bold(proc.name.as_str()), Colorize::dimmed(format!("(PID: {})", proc.pid).as_str())); }
     }
 }
 
@@ -703,66 +512,23 @@ fn validate_args(args: &Args) -> Result<(), String> {
 
 fn main() {
     let args = Args::parse();
-
-    if let Err(e) = validate_args(&args) {
-        eprintln!("{}", Colorize::red(e.as_str()));
-        std::process::exit(1);
-    }
-
-    let signal = match parse_signal(&args.signal) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
+    if let Err(e) = validate_args(&args) { eprintln!("{}", Colorize::red(e.as_str())); std::process::exit(1); }
+    let signal = match parse_signal(&args.signal) { Ok(s) => s, Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); } };
     let ports_mode = args.ports || args.port.is_some();
 
     if args.confirm_nuke {
         let mut sys = System::new_all();
-        let targets = if ports_mode {
-            refresh_processes_with_ports(&mut sys, args.filter.as_deref(), args.port, args.sort)
-        } else {
-            refresh_processes(&mut sys, args.filter.as_deref(), args.sort)
-        };
-
-        if targets.is_empty() {
-            println!("{}", Colorize::red("No matching processes found."));
-            return;
-        }
-
+        let targets = if ports_mode { refresh_processes_with_ports(&mut sys, args.filter.as_deref(), args.port, args.sort) } else { refresh_processes(&mut sys, args.filter.as_deref(), args.sort) };
+        if targets.is_empty() { println!("{}", Colorize::red("No matching processes found.")); return; }
         let orange = colored::Color::TrueColor { r: 255, g: 165, b: 0 };
-
-        println!(
-            "{} {} processes:", 
-            colored::Colorize::color("Targeting", orange).bold(), 
-            targets.len()
-        );
-        
-        for p in &targets {
-            println!("  - [{}] {}", p.pid, p.name);
-        }
-
+        println!("{} {} processes:", colored::Colorize::color("Targeting", orange).bold(), targets.len());
+        for p in &targets { println!("  - [{}] {}", p.pid, p.name); }
         println!("\nAre you sure you want to nuke these? (y/N)");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
-
-        if input.trim().to_lowercase() == "y" {
-            kill_processes(targets, signal);
-        }
+        if input.trim().to_lowercase() == "y" { kill_processes(targets, signal); }
         return;
     }
 
-    if let Err(e) = run_live_mode(
-        args.filter.as_deref(),
-        args.sort,
-        signal,
-        ports_mode,
-        args.port,
-        args.resources,
-    ) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
-    }
+    if let Err(e) = run_live_mode(args.filter.as_deref(), args.sort, signal, ports_mode, args.port, args.resources) { eprintln!("Error: {}", e); std::process::exit(1); }
 }
