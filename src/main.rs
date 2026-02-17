@@ -145,17 +145,20 @@ impl fmt::Display for ProcessInfo {
 struct ResourceHistory {
     cpu_data: Vec<u64>,
     mem_data: Vec<u64>,
+    disk_data: Vec<u64>,
     max_samples: usize,
 }
 
 impl ResourceHistory {
-    fn push(&mut self, cpu: u64, mem: u64) {
+    fn push(&mut self, cpu: u64, mem: u64, disk: u64) {
         if self.cpu_data.len() >= self.max_samples {
             self.cpu_data.remove(0);
             self.mem_data.remove(0);
+            self.disk_data.remove(0);
         }
         self.cpu_data.push(cpu);
         self.mem_data.push(mem);
+        self.disk_data.push(disk)
     }
 }
 
@@ -216,7 +219,11 @@ fn parse_signal(signal_str: &str) -> Result<Signal, String> {
 fn draw_resource_graphs(frame: &mut Frame, history: &ResourceHistory) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(33), 
+            Constraint::Percentage(33), 
+            Constraint::Percentage(34)
+        ])
         .split(frame.area());
     let orange = Color::Rgb(255, 165, 0);
     let cpu_line = Sparkline::default()
@@ -234,12 +241,22 @@ fn draw_resource_graphs(frame: &mut Frame, history: &ResourceHistory) {
                 .title(Line::from(format!(" MEMORY USAGE ({} MB) ", &history.mem_data.last().unwrap_or(&0))).style(Style::default().fg(orange)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(orange))
-                .title_bottom("q - quit")
         )
         .data(&history.mem_data)
         .style(Style::default().fg(Color::Magenta));
+    let disk_line = Sparkline::default()
+        .block(
+            Block::default()
+                .title(Line::from(format!(" DISK USAGE ({} KB/S", &history.disk_data.last().unwrap_or(&0))).style(Style::default().fg(orange)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(orange))
+                .title_bottom("q - quit")
+        )
+        .data(&history.disk_data)
+        .style(Style::default().fg(Color::Yellow));
     frame.render_widget(cpu_line, chunks[0]);
     frame.render_widget(mem_line, chunks[1]);
+    frame.render_widget(disk_line, chunks[2]);
 }
 
 fn run_live_mode(
@@ -262,6 +279,7 @@ fn run_live_mode(
     let mut history = ResourceHistory {
         cpu_data: Vec::new(),
         mem_data: Vec::new(),
+        disk_data: Vec::new(),
         max_samples: 100,
     };
     let mut processes = if ports_mode {
@@ -281,7 +299,14 @@ fn run_live_mode(
             };
             let global_cpu = sys.global_cpu_usage() as u64;
             let total_mem = sys.used_memory() / 1024 / 1024;
-            history.push(global_cpu, total_mem);
+            let total_disk = sys.processes()
+                .iter()
+                .map(|(_, proc)| {
+                    let disk = proc.disk_usage();
+                    (disk.read_bytes + disk.written_bytes) / 1024
+                })
+                .sum::<u64>();
+            history.push(global_cpu, total_mem, total_disk);
             last_refresh = Instant::now();
             if let Some(selected) = table_state.selected() {
                 if selected >= processes.len() && !processes.is_empty() {
