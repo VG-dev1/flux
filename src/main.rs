@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -39,27 +39,35 @@ enum SortBy {
 #[derive(Parser)]
 #[command(name = "flux", version, about = "Search, monitor, and nuke processes with ease", disable_version_flag = true)]
 struct Args {
+    /// Print version
     #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
     _version: (),
 
+    /// Filter processes by keyword
     #[arg(short, long)]
     filter: Option<String>,
 
+    /// Send a specific signal
     #[arg(short, long, default_value = "KILL")]
     signal: String,
 
+    /// Sort by
     #[arg(long, value_enum, default_value = "cpu")]
     sort: SortBy,
 
+    /// Show ports column
     #[arg(long)]
     ports: bool,
 
+    /// Filter by port
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
 
+    /// Nuke processes by keyword
     #[arg(long = "nuke")]
     confirm_nuke: bool,
 
+    /// Show the resource usage graph
     #[arg(long)]
     resources: bool,
 }
@@ -259,6 +267,14 @@ fn draw_resource_graphs(frame: &mut Frame, history: &ResourceHistory) {
     frame.render_widget(disk_line, chunks[2]);
 }
 
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() { return true; }
+    let haystack = haystack.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut chars = haystack.chars();
+    needle.chars().all(|n| chars.any(|h| h == n))
+}
+
 fn run_live_mode(
     filter: Option<&str>,
     sort_by: SortBy,
@@ -288,6 +304,10 @@ fn run_live_mode(
         refresh_processes(&mut sys, filter, sort_by)
     };
     let mut show_confirm = false;
+
+    let mut search_mode = false;
+    let mut search_query = String::new();
+
     loop {
         if last_refresh.elapsed() >= refresh_interval && !show_confirm {
             sys.refresh_cpu_all();
@@ -314,12 +334,22 @@ fn run_live_mode(
                 }
             }
         }
+        let filtered_pids: Vec<u32> = processes
+            .iter()
+            .filter(|p| fuzzy_match(&p.name, &search_query))
+            .map(|p| p.pid)
+            .collect();
+
         terminal.draw(|frame| {
             if show_resources {
                 draw_resource_graphs(frame, &history);
             } else {
                 let area = frame.area();
-                let rows: Vec<Row> = processes
+                let filtered: Vec<&ProcessInfo> = processes
+                    .iter()
+                    .filter(|p| filtered_pids.contains(&p.pid))
+                    .collect();
+                let rows: Vec<Row> = filtered
                     .iter()
                     .map(|p| {
                         let is_selected = selected_pids.contains(&p.pid);
@@ -399,11 +429,33 @@ fn run_live_mode(
                         Block::default()
                             .title(Line::from(title).style(Style::default().fg(orange)))
                             .border_style(Style::default().fg(orange))
-                            .title_bottom(Line::from(" ↑↓ - navigate • Space - select • Enter - kill • q - quit • a - select all ").style(Style::default().fg(orange))),
+                            .title_bottom(Line::from(" ↑↓ - navigate • Space - select • Enter - kill • q - quit • a - select all • / - search ").style(Style::default().fg(orange))),
                     )
                     .row_highlight_style(Style::default().bg(Color::Rgb(128, 85, 0)).fg(Color::White))
                     .highlight_symbol("▶ ");
-                frame.render_stateful_widget(table, area, &mut table_state);
+
+                let (table_area, search_area) = if search_mode {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(0), Constraint::Length(3)])
+                        .split(area);
+                    (chunks[0], Some(chunks[1]))
+                } else {
+                    (area, None)
+                };
+
+                if let Some(sa) = search_area {
+                    let search_widget = Paragraph::new(format!(" {}_", search_query))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(" Search ")
+                                .border_style(Style::default().fg(Color::Cyan))
+                        );
+                    frame.render_widget(search_widget, sa);
+                }
+
+                frame.render_stateful_widget(table, table_area, &mut table_state);
                 if show_confirm {
                     let popup_area = centered_rect(50, 20, area);
                     frame.render_widget(Clear, popup_area);
@@ -416,27 +468,54 @@ fn run_live_mode(
         })?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    if show_confirm {
-                        match key.code {
-                            KeyCode::Enter => break,
-                            KeyCode::Esc => show_confirm = false,
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => { selected_pids.clear(); break; }
-                            KeyCode::Char('a') => {
-                                let all_selected = processes.iter().all(|p| selected_pids.contains(&p.pid));
-                                if all_selected { selected_pids.clear(); } else { for proc in &processes { selected_pids.insert(proc.pid); } }
+            if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, .. }) = event::read()? {
+                if show_confirm {
+                    match code {
+                        KeyCode::Enter => break,
+                        KeyCode::Esc  => show_confirm = false,
+                        _             => {}
+                    }
+                } else if search_mode {
+                    match code {
+                        KeyCode::Esc            => { search_mode = false; search_query.clear(); }
+                        KeyCode::Enter          => { search_mode = false; }
+                        KeyCode::Backspace      => { search_query.pop(); }
+                        KeyCode::Char(c)        => { search_query.push(c); }
+                        _                       => {}
+                    }
+                } else {
+                    match code {
+                        KeyCode::Char('q') | KeyCode::Esc => { selected_pids.clear(); break; }
+                        KeyCode::Char('/')                => { search_mode = true; search_query.clear(); }
+                        KeyCode::Char('a')                => {
+                            let all_selected = processes.iter().all(|p| selected_pids.contains(&p.pid));
+                            if all_selected {
+                                selected_pids.clear();
+                            } else {
+                                selected_pids.extend(processes.iter().map(|p| p.pid));
                             }
-                            KeyCode::Up | KeyCode::Char('k') => { if let Some(selected) = table_state.selected() { if selected > 0 { table_state.select(Some(selected - 1)); } } }
-                            KeyCode::Down | KeyCode::Char('j') => { if let Some(selected) = table_state.selected() { if selected < processes.len().saturating_sub(1) { table_state.select(Some(selected + 1)); } } }
-                            KeyCode::Char(' ') => { if let Some(selected) = table_state.selected() { if let Some(proc) = processes.get(selected) { if selected_pids.contains(&proc.pid) { selected_pids.remove(&proc.pid); } else { selected_pids.insert(proc.pid); } } } }
-                            KeyCode::Enter => { if !selected_pids.is_empty() { show_confirm = true; } }
-                            _ => {}
                         }
+                        KeyCode::Up   | KeyCode::Char('k') => {
+                            let i = table_state.selected().unwrap_or(0);
+                            if i > 0 { table_state.select(Some(i - 1)); }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let i = table_state.selected().unwrap_or(0);
+                            if i < filtered_pids.len().saturating_sub(1) { table_state.select(Some(i + 1)); }
+                        }
+                        KeyCode::Char(' ') => {
+                            if let Some(i) = table_state.selected() {
+                                if let Some(&pid) = filtered_pids.get(i) {
+                                    if !selected_pids.remove(&pid) {
+                                        selected_pids.insert(pid);
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if !selected_pids.is_empty() { show_confirm = true; }
+                        }
+                        _ => {}
                     }
                 }
             }
